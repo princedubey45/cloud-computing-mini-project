@@ -1,0 +1,12 @@
+Memory & Stability Test Results (50 Sequential Requests)
+-------------------------------------------------------
+Total Requests Completed : 50 / 50
+Failures / Errors        : 0 (0.0%)
+CPU Limit Constraint     : 1 vCPU
+Memory Limit Constraint  : 1 GiB (1024 MiB)
+Peak Resident Memory     : 52.28 MiB (5.1% of 1 GiB limit)
+Total Duration           : 0.03 s
+Average Latency          : 0.53 ms
+p50 Latency              : 0.48 ms
+p95 Latency              : 0.7 ms
+Status                   : PASSED with no OOM kill

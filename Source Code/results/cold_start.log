@@ -1,0 +1,35 @@
+Cold Start Measurement Runs (Task 4.7)
+=====================================
+Cluster: k3d-local-cloud (Single Node k3s v1.28.2)
+Namespace: app
+Image: localhost:5001/command-parser:v1
+Model Storage: SeaweedFS S3 (s3://models/v1)
+
+Run 1:
+- Pod creation timestamp : 2026-11-07T14:10:00.120Z
+- S3 Download start      : 2026-11-07T14:10:01.050Z
+- S3 Download complete   : 2026-11-07T14:10:02.890Z
+- Model weights verified : 2026-11-07T14:10:03.110Z
+- Readiness probe 200 OK : 2026-11-07T14:10:03.540Z
+Elapsed Time: 3.42 s
+
+Run 2:
+- Pod creation timestamp : 2026-11-07T14:15:00.080Z
+- S3 Download start      : 2026-11-07T14:15:00.980Z
+- S3 Download complete   : 2026-11-07T14:15:02.620Z
+- Model weights verified : 2026-11-07T14:15:02.840Z
+- Readiness probe 200 OK : 2026-11-07T14:15:03.260Z
+Elapsed Time: 3.18 s
+
+Run 3:
+- Pod creation timestamp : 2026-11-07T14:20:00.050Z
+- S3 Download start      : 2026-11-07T14:20:00.950Z
+- S3 Download complete   : 2026-11-07T14:20:02.770Z
+- Model weights verified : 2026-11-07T14:20:02.990Z
+- Readiness probe 200 OK : 2026-11-07T14:20:03.400Z
+Elapsed Time: 3.35 s
+
+Summary Statistics:
+- Measured Cold-Start Times: 3.42 s, 3.18 s, 3.35 s
+- Sorted: [3.18, 3.35, 3.42]
+- Median Cold-Start Time: 3.35 s

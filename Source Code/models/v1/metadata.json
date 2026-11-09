@@ -1,0 +1,11 @@
+{
+  "model_name": "EleutherAI/pythia-70m-distilled",
+  "version": "v1",
+  "epochs": 3,
+  "seed": 42,
+  "final_loss": 1.6555,
+  "parameters": 70426624,
+  "architecture": "GPTNeoXForCausalLM",
+  "tokenizer": "EleutherAI/pythia-70m",
+  "vocab_size": 50304
+}

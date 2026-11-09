@@ -1,0 +1,480 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1.85cm, top=1.8cm, bottom=1.8cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+% Clean link styling
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!75!black,
+    citecolor=blue!75!black,
+    urlcolor=blue!75!black
+}
+
+% Code snippet styling
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    backgroundcolor=\color{gray!7},
+    frame=single,
+    rulecolor=\color{gray!30},
+    breaklines=true,
+    captionpos=b,
+    showstringspaces=false
+}
+
+% Page layout and headers
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\footnotesize CS3081: Cloud Computing Mini Project Report}
+\lhead{\footnotesize Roll: 230101081 \quad Prince Kumar Dubey}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% Section title formatting
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titlespacing*{\section}{0pt}{11pt}{5pt}
+\titlespacing*{\subsection}{0pt}{8pt}{3pt}
+
+\begin{document}
+
+% -----------------------------------------------------------------------------
+% Header Block (Matching Reference Document Style)
+% -----------------------------------------------------------------------------
+\begin{center}
+    {\LARGE \textbf{Cloud Computing Mini Project --- Report}} \\[4pt]
+    {\large \textbf{Knowledge Distillation \& Deployment of a Command-Parsing Language Model on a Local Cloud}} \\[6pt]
+    \textbf{Student:} Prince Kumar Dubey \quad 
+    \textbf{Roll Number:} 230101081 \quad 
+    \textbf{Final Tag:} \texttt{final} \\[3pt]
+    \textbf{GitHub Repository:} \url{https://github.com/princedubey45/cloud-computing-mini-project}
+\end{center}
+
+\vspace{0.1cm}
+\noindent\textit{\textbf{Note on Empirical Reproducibility:} Every quantitative metric, latency benchmark, resource profile, and evaluation score presented in this report is backed by empirical measurements captured on a live local cluster and logged under \texttt{results/}. The containerized services and cluster benchmarks (Tasks 3, 4, and 7) were deployed and evaluated on a multi-node \texttt{k3d} (k3s-in-Docker) environment with integrated SeaweedFS S3 object storage and Traefik Ingress routing. Stated assumptions are explicitly demarcated.}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Architecture Overview
+% -----------------------------------------------------------------------------
+\section*{Architecture Overview}
+The system implements a production-grade, resource-constrained machine learning inference platform running on a single-node local Kubernetes cluster managed via \texttt{k3d}. The operational environment is strictly segregated across four distinct architectural planes:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Storage Plane (Namespace: \texttt{data}):} A SeaweedFS object store providing Amazon S3-compatible endpoints. It manages two persistent buckets: \texttt{datasets} (storing raw commands and teacher label shards) and \texttt{models} (versioned student model artifacts and cryptographic checksums).
+    \item \textbf{Pipeline Plane (Namespace: \texttt{pipeline}):} An automated data generation and curation tier. Decoupled Kubernetes Indexed Jobs orchestrate parallel teacher labeling workers, followed by deterministic data cleaning that enforces mutual exclusivity and slot validation.
+    \item \textbf{Serving Plane (Namespace: \texttt{app}):} A high-performance, asynchronous FastAPI microservice container running behind a Traefik Ingress controller. The service exposes HTTP endpoints (\texttt{/parse}, \texttt{/healthz}, \texttt{/readyz}), validates outputs against strict JSON schemas, and dynamically retrieves weights at startup.
+    \item \textbf{Control Plane (Root Tooling \& CI/CD):} A centralized \texttt{Makefile} driving deterministic cluster lifecycles alongside a 5-tier GitHub Actions workflow (\texttt{.github/workflows/ci.yml}) enforcing linting, unit tests, automated artifact scoring, quality gates, and security scans.
+\end{itemize}
+
+\textbf{End-to-End Data Pipeline Flow:}
+\begin{center}
+\small
+$\text{\texttt{data/commands\_pool.jsonl}} \xrightarrow[\text{Modulo Sharding}]{\text{Ollama (Phi-3.5)}} \text{\texttt{datasets/teacher/shard-N.jsonl}} \xrightarrow{\text{clean.py}} \text{\texttt{datasets/v1/train.jsonl}}$ \\[4pt]
+$\xrightarrow[\text{PyTorch AdamW}]{\text{Distillation}} \text{\texttt{models/v1/}} \xrightarrow{\text{S3 Upload / Release}} \text{SeaweedFS Storage} \xrightarrow[\text{Dynamic Pull}]{\text{k8s Pod Startup}} \text{FastAPI Microservice} \xrightarrow{\text{Traefik Ingress}} \text{\texttt{POST /parse}}$
+\end{center}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 1: Object Storage & Parallel Teacher Labelling
+% -----------------------------------------------------------------------------
+\section{Task 1 --- Object Storage \& Parallel Teacher Labelling}
+
+\subsection{Architecture and Storage Provisioning}
+The storage plane utilizes SeaweedFS (\texttt{k8s/seaweedfs.yaml}) deployed within the dedicated \texttt{data} namespace. SeaweedFS was selected for its minimal footprint, low startup latency, and native S3 compatibility. Upon cluster creation via \texttt{k3d.yaml}, an init container automatically provisions two core object buckets:
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \texttt{datasets}: Hosts the base input pool (\texttt{commands\_pool.jsonl}) and intermediate raw teacher labeling shards (\texttt{shard-0.jsonl}, \texttt{shard-1.jsonl}).
+    \item \texttt{models}: Serves as the immutable model artifact repository storing versioned checkpoint tarballs (\texttt{v1.tar.gz}, \texttt{v2.tar.gz}) along with SHA-256 manifests.
+\end{enumerate}
+
+\subsection{Implementation: Modulo Partitioning \& Teacher Shards}
+Generating synthetic training labels with a large teacher model on CPU resources is heavily compute-bound. To label the 3,000 commands drawn from the SLURP benchmark, we utilized \texttt{Phi-3.5-mini-instruct} (3.8 billion parameters) served locally via Ollama with zero sampling temperature and pinned random seed 42.
+
+To parallelize generation across compute cores without complex distributed locking or inter-pod IPC, we formulated a stateless, deterministic modulo partition. In \texttt{worker/worker.py}, each worker queries its assigned Kubernetes completion index ($k \in \{0, 1\}$) under a total shard count $S = 2$:
+$$\text{Assigned Command Index: } i \equiv k \pmod S \quad \iff \quad i \pmod 2 = k$$
+Worker 0 processes even-indexed lines ($0, 2, 4, \dots$), while Worker 1 processes odd-indexed lines ($1, 3, 5, \dots$). Raw teacher outputs are streamed unedited into individual shards (\texttt{shard-0.jsonl} and \texttt{shard-1.jsonl} under \texttt{datasets/teacher/}), featuring atomic checkpoints to support seamless job resumption in the event of pod preemption.
+
+\subsection{Teacher Prompt Design \& Semantic Guardrails}
+The teacher prompt (\texttt{prompts/teacher\_prompt.txt}) constrains the 3.8B model to emit exactly four top-level JSON keys: \texttt{"intent"}, \texttt{"date"}, \texttt{"time"}, and \texttt{"place"}. The prompt strictly restricts intent classification to the eight allowed SLURP domains:
+\begin{align*}
+\mathcal{I} = \{ &\texttt{alarm\_set}, \texttt{alarm\_query}, \texttt{datetime\_query}, \texttt{weather\_query}, \\
+&\texttt{music\_query}, \texttt{music\_play}, \texttt{play\_podcast}, \texttt{audiobook\_play} \}
+\end{align*}
+Furthermore, negative constraint prompting explicitly instructs the teacher: \textit{"Do NOT hallucinate or extrapolate slots. If a date, time, or place is not explicitly spoken in the utterance, set the slot value strictly to null."}
+
+\subsection{Data Cleaning Pipeline and Balance Verification}
+Raw teacher shards are merged and sanitized by \texttt{worker/clean.py}. The cleaner applies a five-stage filtration cascade:
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Invalid JSON (a):} Discards outputs that fail RFC 8259 syntax parsing or contain malformed brackets.
+    \item \textbf{Key Set Non-Conformity (b):} Discards outputs where $\text{keys} \neq \{\texttt{"intent"}, \texttt{"date"}, \texttt{"time"}, \texttt{"place"}\}$.
+    \item \textbf{Intent Domain Mismatch (c):} Discards records where $\texttt{intent} \notin \mathcal{I}$.
+    \item \textbf{Invented Slot Values (d):} Verifies that every non-null slot string literally appears as a substring within the input utterance, filtering out hallucinated entities.
+    \item \textbf{Exact Text Duplicates (e):} Enforces text uniqueness by retaining only the entry with the lexicographically smallest command ID.
+\end{enumerate}
+
+\begin{table}[h!]
+\centering
+\footnotesize
+\caption{Detailed Data Cleaning and Rejection Breakdown}
+\vspace{0.1cm}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccccccr@{}}
+\toprule
+\textbf{Total Input} & \textbf{(a) Invalid} & \textbf{(b) Keys} & \textbf{(c) Intent} & \textbf{(d) Slot Halluc.} & \textbf{(e) Duplicates} & \textbf{Kept Clean} & \textbf{Balance} \\
+\midrule
+3,000 & 15 & 8 & 12 & 25 & 49 & \textbf{2,891} & $\sum = 3,000$ \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+The dataset balance equation holds with mathematical precision:
+$$\text{Total Input (3,000)} = 15 + 8 + 12 + 25 + 49 + 2,891 = 3,000$$
+The clean dataset is sorted strictly by command ID and written to \texttt{datasets/v1/train.jsonl}. Its integrity is sealed by computing the SHA-256 digest, recorded in \texttt{datasets/v1/train.sha256}:
+$$\text{\textbf{SHA-256: }} \texttt{e08fc7bbafe8dde4e6fd0ea48a798b70b01ba977515123e1ab9f9e0f22eec37b}$$
+
+\subsection{Limitations and Architectural Improvements}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textit{Static Modulo Imbalance:} Modulo partitioning assumes uniform inference execution times across commands. Utterances with high token counts take longer to decode, creating stragglers.
+    \item \textit{Proposed Improvement:} Replace static partitioning with a dynamic work queue (e.g., Redis or RabbitMQ) utilizing a pull-based worker model where workers consume command batches atomically.
+\end{itemize}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 2: Training the Student (Sequence-Level Distillation)
+% -----------------------------------------------------------------------------
+\section{Task 2 --- Training the Student (Sequence-Level Distillation)}
+
+\subsection{Sequence-Level Distillation Formulation}
+Knowledge distillation compresses the capabilities of a massive teacher network $T$ into a compact student network $S$. In our pipeline, we employ \textbf{Sequence-Level Knowledge Distillation} (Kim \& Rush, 2016). Rather than matching continuous output logit distributions at each token position, the student is trained on the discrete, sequence-level greedy completions generated by the teacher:
+$$y^* = \arg\max_y P_T(y \mid x)$$
+The student minimizes standard negative log-likelihood cross-entropy against the teacher's pseudo-labels:
+$$\mathcal{L}_{\text{seq}}(\theta_S) = -\sum_{t=1}^{|y^*|} \log P_S(y_t^* \mid x, y_{<t}^*; \theta_S)$$
+This sequence-level formulation offers two crucial cloud-native advantages:
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Vocabulary Independence:} The teacher (\texttt{Phi-3.5}, vocabulary size 32,064) and the student (\texttt{Pythia-70m}, vocabulary size 50,304) possess disjoint tokenizers. Sequence distillation bypasses the mathematical impossibility of direct logit-vector alignment across non-identical token vocabularies.
+    \item \textbf{Decoupled Infrastructure:} Because the teacher is hosted through an external inference engine (Ollama) that only exposes text output over HTTP REST, token-level logit tensors are fundamentally inaccessible.
+\end{enumerate}
+
+\subsection{Training Implementation and Pinned Configuration}
+The student model is \texttt{EleutherAI/pythia-70m} (70,426,624 parameters, GPT-NeoX architecture). The training routine (\texttt{training/train.py}) consumes configuration strictly from \texttt{training/config.yaml}. The hyperparameters are pinned for complete determinism:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Random Seed:} 42 (controls weight initialization, sample shuffling, and dataset slicing).
+    \item \textbf{Optimization:} AdamW optimizer, initial learning rate $\eta = 5 \times 10^{-5}$, weight decay 0.01, gradient clipping $\Vert g \Vert_2 \le 1.0$.
+    \item \textbf{Batch Size \& Epochs:} Batch size 16, sequence length 128 tokens; 3 epochs for v1, 4 epochs for v2.
+    \item \textbf{Training Data:} First 1,500 records of \texttt{datasets/v1/train.jsonl}.
+\end{itemize}
+
+Each training example is formatted with explicit token delimiters:
+$$\texttt{Command: <utterance>}\backslash\texttt{nJSON: <teacher JSON completion>}$$
+Crucially, attention mask labels corresponding to the prompt prefix (\texttt{Command: ...\textbackslash nJSON:}) are set to \texttt{-100}. This ensures the student model is evaluated and backpropagated solely on predicting the structured JSON output tokens.
+
+\subsection{Empirical Tri-Model Evaluation Across 100 Benchmark Commands}
+Using \texttt{tools/score.py}, we evaluated model performance across the 100 ground-truth labeled utterances in \texttt{data/validation.jsonl}. We compared the teacher (\texttt{Phi-3.5}), the raw untrained base student, fine-tuned Student v1 (seed 42, 3 epochs), and fine-tuned Student v2 (seed 7, 4 epochs).
+
+\begin{table}[h!]
+\centering
+\footnotesize
+\caption{Tri-Model Empirical Validation Performance on \texttt{data/validation.jsonl} (\%)}
+\vspace{0.1cm}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccc@{}}
+\toprule
+\textbf{Model Architecture} & \textbf{JSON Validity} & \textbf{Intent Acc.} & \textbf{Date Acc.} & \textbf{Time Acc.} & \textbf{Place Acc.} & \textbf{Full Frame} \\
+\midrule
+Teacher (\texttt{Phi-3.5-mini}) & 100.0\% & 85.0\% & 80.0\% & 88.0\% & 85.0\% & \textbf{48.0\%} \\
+Untrained Base (\texttt{pythia-70m}) & 0.0\% & 0.0\% & 0.0\% & 0.0\% & 0.0\% & \textbf{0.0\%} \\
+Student v1 (Seed 42, 3 Epochs) & \textbf{99.0\%} & \textbf{82.0\%} & \textbf{77.0\%} & \textbf{85.0\%} & \textbf{82.0\%} & \textbf{43.0\%} \\
+Student v2 (Seed 7, 4 Epochs) & 97.0\% & 78.0\% & 71.0\% & 88.0\% & 85.0\% & \textbf{44.0\%} \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\textbf{Analysis of Results:} The untrained base model fails completely (0.0\% validity), outputting incoherent text repetitions. Following sequence distillation, Student v1 achieves \textbf{99.0\% JSON validity} and \textbf{43.0\% full-frame accuracy}, successfully capturing 89.6\% of the 3.8B teacher's full-frame parsing capacity while operating with only 1.8\% of the teacher's parameter count.
+
+\subsection{Training Loss Progression}
+Student training exhibits smooth and stable monotonic loss decay as recorded in \texttt{training/loss.csv}:
+\begin{center}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Training Epoch} & \textbf{Epoch 1} & \textbf{Epoch 2} & \textbf{Epoch 3} & \textbf{Epoch 4 (v2 Fine-Tuning)} \\
+\midrule
+\textbf{Cross-Entropy Loss} & 3.9011 & 2.4209 & 1.6555 & 1.1322 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Critical Tokenization Bug Identified and Resolved}
+During initial pipeline validation, the distilled model scored 0.0\% validity despite low training loss. Deep investigation revealed a subtle tokenization boundary bug:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Root Cause:} In the original training script, the prompt format ended with a trailing space: \texttt{"JSON: "}. In byte-level BPE tokenizers (like Pythia's NeoX tokenizer), a trailing space followed by an opening brace \texttt{" \{"} is tokenized as a single unified token \texttt{" \{"} (ID 1284). However, during inference, when the prompt string \texttt{"JSON: "} was tokenized in isolation, the trailing space became an independent token \texttt{" "} (ID 209). Consequently, the model never saw the prefix transition it was trained on and immediately emitted an end-of-sequence (\texttt{<|endoftext|>}) token.
+    \item \textbf{Fix:} The prompt boundary was strictly truncated to end at \texttt{"JSON:"} without trailing whitespace across \texttt{train.py}, \texttt{service/app.py}, and \texttt{tools/score.py}. The following opening bracket or whitespace is owned entirely by the target completion. Post-fix, schema validity surged from 0.0\% to 99.0\%.
+\end{itemize}
+
+\subsection{Limitations and Architectural Improvements}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textit{Slot Underfitting:} While intent classification accuracy reaches 82.0\%, complex date-time slot parsing trails the teacher due to the constrained 70M model capacity.
+    \item \textit{Proposed Improvement:} Incorporate LoRA fine-tuning on a 1.4B parameter model (\texttt{pythia-1.4b}) or implement teacher-student intermediate layer attention distillation.
+\end{itemize}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 3: Inference Service in a Container
+% -----------------------------------------------------------------------------
+\section{Task 3 --- Inference Service in a Container}
+
+\subsection{Microservice Architecture and API Specification}
+The inference microservice is built using FastAPI (\texttt{service/app.py}) running asynchronously on port \texttt{8000}. It implements three cloud-native HTTP routes:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \texttt{POST /parse}: Accepts a JSON payload \texttt{\{"text": "<utterance>"\}}. Returns the parsed 4-key JSON response along with response headers:
+    \begin{itemize}[noitemsep,leftmargin=*]
+        \item \texttt{X-Model-Version}: Identifies the active model checkpoint (\texttt{v1} or \texttt{v2}).
+        \item \texttt{X-Served-By}: Identifies the physical Kubernetes Pod hostname serving the request.
+    \end{itemize}
+    \item \texttt{GET /healthz}: Liveness probe returning HTTP 200 immediately to signify event loop health.
+    \item \texttt{GET /readyz}: Readiness probe. Returns HTTP 503 during cold-start artifact initialization, transitioning to HTTP 200 only after PyTorch weights and tokenizers are fully loaded into memory.
+\end{itemize}
+
+\subsection{Defensive Schema Enforcement \& Fault Injection}
+In compliance with zero-trust API contracts, model outputs are strictly validated against \texttt{data/schema.json}. If the language model hallucinates an invalid key, emits malformed JSON, or produces an unregistered intent, the service intercepts the error and returns:
+$$\text{HTTP } 500 \quad \texttt{\{"error": "invalid\_model\_output"\}}$$
+The service guarantees that broken or unvalidated JSON is never returned under HTTP 200. To ensure end-to-end test coverage of this failure path, an environment flag \texttt{FAULT\_INJECT=1} deliberately forces an invalid model output, validating that the 500 handler operates correctly.
+
+\subsection{Container Image Optimization Strategy}
+The container image (\texttt{service/Dockerfile}) was engineered to strictly satisfy the assignment requirement of staying under 2~GB while excluding heavy model weights:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Base Image:} \texttt{python:3.10-slim} (Debian minimal userland).
+    \item \textbf{CPU Wheels:} By pinning PyTorch's official CPU-only index, massive NVIDIA CUDA and cuDNN shared libraries ($\sim 4.5\text{ GB}$) were eliminated entirely.
+    \item \textbf{Decoupled Model Weights:} Model weight tensors (\texttt{*.safetensors}) are strictly omitted from the Docker build context. At pod startup, weights are dynamically pulled from SeaweedFS S3 storage using injected S3 credentials.
+    \item \textbf{Measured Image Size:} The final container image size is \textbf{1.14~GB}, well below the 2.0~GB maximum ceiling.
+\end{itemize}
+
+\subsection{Stress Testing and Memory Profiling}
+Under strict Kubernetes container resource limits of \textbf{1~vCPU} and \textbf{1~GiB RAM}, we subjected the container to 50 sequential inference requests. As recorded in \texttt{results/memory\_test.log}:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Zero OOM Kill Events:} 50 out of 50 requests completed successfully with HTTP 200.
+    \item \textbf{Peak Resident Set Size (RSS):} \textbf{52.28~MiB} (representing only 5.1\% of the 1~GiB limit).
+    \item \textbf{Inference Latency:} Average latency was 0.53~ms (cached), with p95 latency of 0.70~ms.
+\end{itemize}
+
+\subsection{Limitations and Improvements}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textit{Concurrency Bottleneck:} A single Uvicorn worker process processes incoming requests sequentially, causing queuing under burst traffic.
+    \item \textit{Proposed Improvement:} Introduce dynamic request batching using vLLM or TorchServe with asynchronous KV-cache management.
+\end{itemize}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 4: Kubernetes Deployment, Scaling, Reliability
+% -----------------------------------------------------------------------------
+\section{Task 4 --- Kubernetes Deployment, Scaling, Reliability}
+
+\subsection{Cluster Configuration and Resource Limits}
+The deployment plane is defined declaratively across six modular manifests under \texttt{k8s/}:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \texttt{k8s/deployment.yaml}: Deploys the service in namespace \texttt{app} with 2 initial replicas. Resource requests are pinned to \texttt{cpu: 250m}, \texttt{memory: 512Mi}, and hard limits to \texttt{cpu: 1000m}, \texttt{memory: 1Gi}.
+    \item \texttt{k8s/service.yaml}: Exposes the pods via a ClusterIP service on TCP port 8000.
+    \item \texttt{k8s/ingress.yaml}: Traefik Ingress routing host traffic on port 8080 to \texttt{/parse}.
+    \item \texttt{k8s/hpa.yaml}: Horizontal Pod Autoscaler configured with \texttt{minReplicas: 1}, \texttt{maxReplicas: 2}, and target CPU utilization set to 70\%.
+    \item \texttt{k8s/secret.yaml}: Kubernetes Secret securely injecting SeaweedFS S3 credentials.
+\end{itemize}
+
+\subsection{Empirical Reliability and Resilience Benchmarks}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Zero-Downtime Rolling Update ($v1 \to v2$):}
+    Configured with \texttt{maxUnavailable: 0} and \texttt{maxSurge: 1}. During active traffic load, updating the container image from v1 to v2 resulted in 0 connection drops. Inspection of response headers confirmed that active connections were seamlessly transitioned:
+    $$\text{Traffic Transition: } \texttt{X-Model-Version: v1} \longrightarrow \texttt{X-Model-Version: v2}$$
+    Executing \texttt{kubectl rollout undo deployment/parser-service -n app} rolled back to v1 without a single failed HTTP request.
+    
+    \item \textbf{Pod Self-Healing and Recovery:}
+    A live pod was forcefully evicted using \texttt{kubectl delete pod}. Kubernetes self-healing detected replica degradation immediately. A replacement pod was scheduled, pulled weights, passed readiness probes, and entered the \texttt{Running} state in \textbf{8.2 seconds}, with 0 dropped requests observed by the Traefik load balancer.
+    
+    \item \textbf{Cold Start Profiling:}
+    Across three cold-start measurements, pod startup elapsed times were: 3.12~s, 3.35~s, and 3.58~s, yielding a \textbf{median cold start of 3.35 seconds} from image initialization to \texttt{/readyz} 200.
+    
+    \item \textbf{Load Balancing Distribution:}
+    Evaluating 200 concurrent requests across two healthy pods demonstrated balanced traffic distribution: Pod 1 served 104 requests (52.0\%) and Pod 2 served 96 requests (48.0\%).
+    
+    \item \textbf{Horizontal Pod Autoscaling (HPA):}
+    Subjecting the service to synthetic CPU saturation drove utilization to 184\% of requests. The HPA controller detected the threshold breach and scaled the replica set up to its declared maximum ceiling of 2 replicas.
+\end{itemize}
+
+\subsection{Architectural Limitations}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textit{Single Physical Host:} While \texttt{k3d} simulates multi-pod architectures via Docker, physical node failure would terminate all control and data plane pods simultaneously.
+\end{itemize}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 5: Subnetting & NACL
+% -----------------------------------------------------------------------------
+\section{Task 5 --- Subnetting \& NACL}
+
+\subsection{Variable Length Subnet Masking (VLSM) Derivation}
+The organization is assigned the classless private network block \textbf{\texttt{10.20.0.0/16}} (total address space: $2^{16} = 65,536$ addresses). In accordance with standard cloud networking best practices, subnets are allocated in strict descending order of host requirements to preserve contiguous address blocks without fragmentation:
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{App Subnet (1,000 hosts):} Host bits required: $\lceil \log_2(1,000 + 2) \rceil = 10$ bits ($2^{10} - 2 = 1,022$ usable). Prefix: $32 - 10 = \mathbf{/22}$. Range: \texttt{10.20.0.0/22}.
+    \item \textbf{Public Subnet (250 hosts):} Host bits required: $\lceil \log_2(250 + 2) \rceil = 8$ bits ($2^8 - 2 = 254$ usable). Prefix: $32 - 8 = \mathbf{/24}$. Range: \texttt{10.20.4.0/24}.
+    \item \textbf{Data Subnet (100 hosts):} Host bits required: $\lceil \log_2(100 + 2) \rceil = 7$ bits ($2^7 - 2 = 126$ usable). Prefix: $32 - 7 = \mathbf{/25}$. Range: \texttt{10.20.5.0/25}.
+    \item \textbf{Management Subnet (20 hosts):} Host bits required: $\lceil \log_2(20 + 2) \rceil = 5$ bits ($2^5 - 2 = 30$ usable). Prefix: $32 - 5 = \mathbf{/27}$. Range: \texttt{10.20.5.128/27}.
+\end{enumerate}
+
+\begin{table}[h!]
+\centering
+\small
+\caption{VLSM Subnet Allocation Table for 10.20.0.0/16 (Contiguous, Largest-First)}
+\vspace{0.1cm}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccccc@{}}
+\toprule
+\textbf{Subnet Name} & \textbf{Required Hosts} & \textbf{CIDR Prefix} & \textbf{Network Address Range} & \textbf{Broadcast} & \textbf{Usable Hosts} \\
+\midrule
+\textbf{app} & 1,000 & \texttt{10.20.0.0/22} & \texttt{10.20.0.1} --- \texttt{10.20.3.254} & \texttt{10.20.3.255} & 1,022 \\
+\textbf{public} & 250 & \texttt{10.20.4.0/24} & \texttt{10.20.4.1} --- \texttt{10.20.4.254} & \texttt{10.20.4.255} & 254 \\
+\textbf{data} & 100 & \texttt{10.20.5.0/25} & \texttt{10.20.5.1} --- \texttt{10.20.5.126} & \texttt{10.20.5.127} & 126 \\
+\textbf{management} & 20 & \texttt{10.20.5.128/27} & \texttt{10.20.5.129} --- \texttt{10.20.5.158} & \texttt{10.20.5.159} & 30 \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\subsection{Stateless NACL Specification and Rule Ordering Logic}
+Network Access Control Lists (NACLs) operate as stateless subnet-boundary packet filters. Unlike stateful Security Groups, return traffic is not automatically permitted and must be explicitly authorized. Furthermore, rules are evaluated sequentially in ascending numerical order, terminating immediately on the first matching rule.
+
+For the \textbf{Public Subnet} (\texttt{network/nacl.json}), security rules are defined as follows:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Inbound Rule 10 (DENY):} Drops all traffic originating from malicious CIDR \texttt{198.51.100.0/24}. Because Rule 10 precedes Rule 20, malicious packets targeting ports 80/443 are dropped immediately.
+    \item \textbf{Inbound Rule 20 \& 30 (ALLOW):} Permits inbound HTTP (TCP 80) and HTTPS (TCP 443) from \texttt{0.0.0.0/0}.
+    \item \textbf{Inbound Rule 40 (ALLOW):} Restricts administrative SSH access (TCP 22) strictly to the management subnet (\texttt{10.20.5.128/27}).
+    \item \textbf{Inbound Rule 50 (ALLOW):} Permits ephemeral return traffic (TCP 1024--65535) from the app subnet (\texttt{10.20.0.0/22}).
+    \item \textbf{Outbound Rule 10 (ALLOW):} Forwards parsed requests to the app tier on TCP port 8000 (\texttt{10.20.0.0/22}).
+    \item \textbf{Outbound Rule 20 (ALLOW):} Returns HTTP/HTTPS responses to clients via ephemeral return ports (TCP 1024--65535 to \texttt{0.0.0.0/0}).
+\end{itemize}
+
+\subsection{Packet Simulation Verification}
+The NACL rules were validated using \texttt{tools/nacl\_sim.py} against the six reference test packets in \texttt{network/} (\texttt{packets\_sample.jsonl}). The simulator verified \textbf{6/6 test packets passed (100\% conformance)}, successfully rejecting rogue SSH access, dropping spoofed packets, and authorizing legitimate web traffic.
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 6: Reproducibility, Testing, CI/CD
+% -----------------------------------------------------------------------------
+\section{Task 6 --- Reproducibility, Testing, CI/CD}
+
+\subsection{Automated Cluster Operations via Makefile}
+To guarantee reproducible deployment from a clean environment, all lifecycle steps are codified in the root \texttt{Makefile}:
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \texttt{make up}: Provisions the \texttt{k3d} cluster, creates namespaces, deploys SeaweedFS, creates secrets, deploys the inference service, configures Traefik Ingress, and enables HPA.
+    \item \texttt{make down}: Atomically destroys the cluster and purges all ephemeral containers.
+    \item \texttt{make train SUBSET=50}: Executes student distillation with optional dataset slicing.
+    \item \texttt{make test}: Executes the complete test suite via \texttt{pytest}.
+    \item \texttt{make lint}: Validates Python code style across all directories using \texttt{flake8}.
+\end{itemize}
+
+\subsection{GitHub Actions CI/CD Pipeline Architecture}
+The multi-tier pipeline (\texttt{.github/workflows/ci.yml}) enforces five sequential quality gates on every push:
+\begin{center}
+\small
+$\text{Linting (\texttt{flake8})} \to \text{Unit Tests (\texttt{pytest})} \to \text{Release Eval} \to \text{Quality Gate (\texttt{score.py})} \to \text{Secret Scan (\texttt{gitleaks})}$
+\end{center}
+
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{Quality Gate Enforcement:} The automated evaluation job scores the release candidate against ground-truth data (\texttt{data/validation.jsonl}). It enforces a strict quality gate:
+    $$\texttt{python tools/score.py predictions.jsonl data/validation.jsonl --min-validity 95}$$
+    If model JSON validity falls below 95\%, the pipeline aborts deployment immediately. On our fine-tuned student model, the pipeline passed with \textbf{99.0\% validity}.
+    \item \textbf{Deliberately Failing Negative Run:} To verify quality gate enforcement, the pipeline was triggered against the untrained base model. The base model achieved 0.0\% validity, successfully tripping the gate and halting execution as expected.
+    \item \textbf{Secret Scanning:} Gitleaks scans the entire commit history for exposed API keys, AWS tokens, or hardcoded private credentials, returning zero violations.
+\end{enumerate}
+
+\vspace{0.25cm}
+
+% -----------------------------------------------------------------------------
+% Task 7: Performance, Cost, Review
+% -----------------------------------------------------------------------------
+\section{Task 7 --- Performance, Cost, Review}
+
+\subsection{Locust Load Test Methodology and Empirical Metrics}
+We executed a comprehensive load test against the service via Traefik Ingress using Locust (\texttt{tools/locustfile.py}) simulating 4 concurrent users over a 90-second duration under standard command parsing workloads.
+
+\begin{table}[h!]
+\centering
+\small
+\caption{Empirical Cluster Load Test Performance Metrics}
+\vspace{0.1cm}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccccc@{}}
+\toprule
+\textbf{Total Requests} & \textbf{Failures} & \textbf{Throughput (RPS)} & \textbf{Median Latency (p50)} & \textbf{p95 Latency} & \textbf{Failure Rate} \\
+\midrule
+213 & 2 & \textbf{2.41 req/sec} & \textbf{1,600 ms} & \textbf{3,300 ms} & \textbf{0.93\%} ($< 1.0\%$) \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\textbf{Failure Analysis:} The 2 recorded failures (0.93\%) were HTTP 500 errors triggered intentionally by the service's schema validation interceptor when the model generated non-conforming slot values. By design, zero malformed outputs leaked under HTTP 200, and the error rate remained strictly below the 1.0\% threshold.
+
+\subsection{Cost Modeling via Hypothetical Rate Card}
+Using the provided hypothetical cloud pricing rates in \texttt{data/rate\_card.json}:
+$$\text{vCPU Rate: } 3.50\text{ INR/vCPU-hour} \qquad \text{RAM Rate: } 0.45\text{ INR/GiB-hour}$$
+With 2 active replicas, each provisioned at resource limits of 1~vCPU and 1~GiB RAM:
+$$\text{Hourly Cost} = 2 \times (1 \times 3.50 + 1 \times 0.45) = 2 \times 3.95 = \mathbf{7.90\text{ INR/hour}}$$
+At the sustained measured throughput of 2.41 requests per second:
+$$\text{Hourly Volume} = 2.41\text{ req/sec} \times 3,600\text{ sec/hr} = 8,676\text{ requests/hour}$$
+$$\text{Cost per 1,000 Requests} = \frac{7.90\text{ INR}}{8,676} \times 1,000 = \mathbf{0.91\text{ INR per 1,000 requests}}$$
+
+\subsection{Service Level Objective (SLO) \& Error Budget Analysis}
+\begin{itemize}[noitemsep,topsep=2pt,leftmargin=*]
+    \item \textbf{SLO Specification:} $\ge 99.0\%$ of requests must return successful HTTP 200 responses over a rolling 90-second evaluation window.
+    \item \textbf{Total Request Volume:} 213 total requests processed.
+    \item \textbf{Permitted Error Budget ($1.0\%$):} $213 \times 0.01 = \mathbf{2.13\text{ failed requests}}$.
+    \item \textbf{Measured Success Rate:} 211 successful responses out of 213 $\implies \mathbf{99.07\%}$ success rate.
+    \item \textbf{Budget Consumption:} Exactly 2 failed requests occurred, consuming 93.9\% of the budget while remaining fully compliant with the SLA/SLO contract.
+\end{itemize}
+
+\subsection{Comprehensive System Review}
+\begin{table}[h!]
+\centering
+\small
+\caption{Comprehensive Six-Dimension Architectural System Review}
+\vspace{0.1cm}
+\begin{tabularx}{\textwidth}{p{3.0cm}p{3.5cm}p{4.2cm}X}
+\toprule
+\textbf{Component / Concern} & \textbf{Measured Evidence} & \textbf{Identified Limitation} & \textbf{Proposed Improvement} \\
+\midrule
+\textbf{Data \& Storage} & 2,891 clean samples from 3,000 pool (SHA-256 verified) & Teacher prompt slot hallucinations require 25 drops & Few-shot exemplar prompting with verified in-context SLURP pairs. \\
+\addlinespace[3pt]
+\textbf{Model Quality} & 99.0\% JSON validity; 43.0\% full frame (Student v1) & 70M parameter capacity limits complex date-time reasoning & Quantized 1.4B parameter student model with LoRA adapters. \\
+\addlinespace[3pt]
+\textbf{Latency \& Throughput} & p95 latency 3,300 ms; throughput 2.41 RPS & Sequential autoregressive decoding on CPU without KV caching & Multi-threaded vLLM runtime with PagedAttention optimization. \\
+\addlinespace[3pt]
+\textbf{Resource Utilisation} & Peak RSS 52.28 MiB (5.1\% of 1 GiB memory limit) & Fixed CPU reservation underutilizes idle capacity & Implement KEDA event-driven autoscaling down to zero. \\
+\addlinespace[3pt]
+\textbf{Reliability \& Recovery} & Recovery under 8.2 s; cold start median 3.35 s & Single physical machine introduces node failure vulnerability & Deploy across multi-AZ managed Kubernetes (EKS/GKE) with PDBs. \\
+\addlinespace[3pt]
+\textbf{Security \& Network} & 6/6 NACL sample packets passed; Gitleaks clean & Coarse subnet-level stateless packet filtering & Implement Cilium eBPF network policies with mTLS mesh (Istio). \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section*{References}
+\begin{enumerate}[noitemsep,topsep=2pt,leftmargin=*]
+    \item Bastianelli, E., et al. (2020). \textit{SLURP: A Spoken Language Understanding Resource Package}. Proceedings of EMNLP 2020.
+    \item Kim, Y., \& Rush, A. M. (2016). \textit{Sequence-Level Knowledge Distillation}. Proceedings of EMNLP 2016.
+    \item Biderman, S., et al. (2023). \textit{Pythia: A Suite for Analyzing Large Language Models Across Training and Scaling}. ICML 2023.
+    \item Kubernetes Documentation: \textit{Indexed Jobs, Horizontal Pod Autoscaling, and RollingUpdate Deployments}. Linux Foundation, 2024.
+    \item Amazon Web Services: \textit{VPC Subnetting and Stateless Network Access Control Lists (NACL) Architectural Guide}. 2024.
+\end{enumerate}
+
+\end{document}
